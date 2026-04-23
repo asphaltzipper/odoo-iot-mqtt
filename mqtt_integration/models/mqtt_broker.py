@@ -55,6 +55,7 @@ class MQTTBroker(models.Model):
     host_info = fields.Char(string='Host Info', compute='_compute_host_info', readonly=True)
     last_connected = fields.Datetime(string="Last Connected")
     last_started = fields.Datetime(string="Last Started")
+    listener_pid = fields.Integer('Listener PID', readonly=True, default=0)
 
     _sql_constraints = [
         ('name_uniq', 'unique(name)', 'Configuration brokers name must be unique!'),
@@ -210,8 +211,8 @@ class MQTTBroker(models.Model):
                     _logger.error(f"The broker {broker.name} must be in a connected state.")
                     raise UserError(f"The broker {broker.name} must be in a connected state.")
                 if broker.listener_status == 'run' and broker.id in broker_threads and broker_threads[broker.id].is_alive():
-                    _logger.error(f"Listener for broker {broker.name} already running.")
-                    raise UserError(f"Listener for broker {broker.name} already running.")
+                    _logger.error(f"Listener {os.getpid()} for broker {broker.name} already running.")
+                    raise UserError(f"Listener {os.getpid()} for broker {broker.name} already running.")
 
                 stop_event = threading.Event()
                 broker_stop_flags[broker.id] = stop_event
@@ -223,13 +224,18 @@ class MQTTBroker(models.Model):
                 )
                 broker_threads[broker.id] = thread
                 thread.start()
-
-                broker.write({
-                    'listener_status': 'run',
-                    'progressing_broker': f"Listener for broker {broker.name} started successfully.",
-                    'last_started': fields.Datetime.now()
-                })
-                _logger.info(f"Started listener for broker {broker.name}.")
+                progressing_broker = f"Listener for broker {broker.name} started successfully."
+                self.env.cr.execute("""                                                                                      
+                    UPDATE mqtt_broker                                
+                    SET listener_pid = %s, listener_status = 'run', last_started = NOW(),
+                      progressing_broker = %s                                                          
+                    WHERE id = %s AND (listener_pid IS NULL OR listener_pid = 0)                                             
+                """, (os.getpid(), progressing_broker, broker.id))
+                if self.env.cr.rowcount == 0:
+                    _logger.info(f"Broker {broker.name} already claimed by another worker. Stopping orphan thread.")
+                    stop_event.set()
+                    return
+                _logger.info(f"Started listener {os.getpid()} for broker {broker.name}.")
 
             except Exception as e:
                 _logger.error(f"Error start listener for broker {broker.name}: {e}")
@@ -243,7 +249,7 @@ class MQTTBroker(models.Model):
             try:
                 if broker.listener_status != 'run':
                     _logger.warning(
-                        f"Listener for broker {broker.name} is not running (current state: {broker.listener_status}).")
+                        f"Listener for broker {broker.name} is not running (current status: {broker.listener_status}).")
                     broker.write({'listener_status': 'stop'})
                     return
 
@@ -262,7 +268,8 @@ class MQTTBroker(models.Model):
                     broker_threads.pop(broker.id, None)
                     broker.write({
                         'listener_status': 'stop',
-                        'progressing_broker': f"Listener for broker {broker.name} stopped successfully.",
+                        'listener_pid': 0,
+                        'progressing_broker': f"Listener {os.getpid()} for broker {broker.name} stopped successfully.",
                     })
                     _logger.info(f"Fully disconnected broker {broker.name}.")
                 else:
@@ -270,6 +277,7 @@ class MQTTBroker(models.Model):
                         f"No active stop flag for broker {broker.name}. Maybe already stopped or Odoo has been restarted.")
                     broker.write({
                         'listener_status': 'stop',
+                        'listener_pid': 0,
                         'progressing_broker': f"Listener for broker {broker.name} already stopped or Odoo has been restarted.",
                     })
 
@@ -534,6 +542,16 @@ class MQTTBroker(models.Model):
             ('listener_status', 'in', ['run', 'stop'])
         ])
         for broker in brokers:
+            pid = broker.listener_pid
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    _logger.info(f"Broker {broker.name} owned by listener {pid} is skipped.")
+                    continue
+                except (ProcessLookupError, PermissionError):
+                    _logger.warning(f"Listener {pid} is dead")
+                    self.env.cr.execute("UPDATE mqtt_broker SET listener_pid = 0 WHERE id = %s", (broker.id,))
+                    broker.invalidate_recordset()
             # If the broker does not have a listener thread running (due to just restarting), start again
             # Condition: check RAM variable/dict broker_threads
             if broker.id not in broker_threads or not broker_threads[broker.id].is_alive():
@@ -545,14 +563,13 @@ class MQTTBroker(models.Model):
     @api.model
     def _cron_broker_listener_auto_start(self):
         """Cron job to auto start all connection brokers"""
-        for broker in self:
-            try:
-                if broker.state != 'connect' and broker.auto_reconnect:
-                    broker.action_reconnect()
-                broker.auto_start_all_listeners()
-            except Exception as e:
-                _logger.error(f"Error auto start listener for broker {broker.name}: {e}")
-                pass
+        for broker in self.search([('auto_reconnect', '=', True), ('state', '!=', 'connect')]):
+            broker.action_reconnect()
+        try:
+            self.auto_start_all_listeners()
+        except Exception as e:
+            _logger.error(f"Error auto start listener for broker: {e}")
+            pass
         _logger.info("Cron job to auto start all connected brokers completed.")
         return True
 

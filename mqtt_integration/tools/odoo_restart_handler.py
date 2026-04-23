@@ -16,7 +16,7 @@ def stop_mqtt_on_shutdown():
     registries = Registry.registries.d
     for db_name, registry_obj in registries.items():
         try:
-            with registry_obj.cursor(timeout=10) as cr:
+            with registry_obj.cursor() as cr:
                 env = api.Environment(cr, SUPERUSER_ID, {})
                 if 'mqtt.broker' in env:
                     service = env['mqtt.broker'].search([], limit=1)
