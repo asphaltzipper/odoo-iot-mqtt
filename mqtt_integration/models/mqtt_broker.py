@@ -225,11 +225,11 @@ class MQTTBroker(models.Model):
                 broker_threads[broker.id] = thread
                 thread.start()
                 progressing_broker = f"Listener for broker {broker.name} started successfully."
-                self.env.cr.execute("""                                                                                      
-                    UPDATE mqtt_broker                                
+                self.env.cr.execute("""
+                    UPDATE mqtt_broker
                     SET listener_pid = %s, listener_status = 'run', last_started = NOW(),
-                      progressing_broker = %s                                                          
-                    WHERE id = %s AND (listener_pid IS NULL OR listener_pid = 0)                                             
+                      progressing_broker = %s
+                    WHERE id = %s AND (listener_pid IS NULL OR listener_pid = 0)
                 """, (os.getpid(), progressing_broker, broker.id))
                 if self.env.cr.rowcount == 0:
                     _logger.info(f"Broker {broker.name} already claimed by another worker. Stopping orphan thread.")
